@@ -35,13 +35,28 @@ An address is required and must contain exactly 20 hexadecimal bytes. POST compa
 
 Missing facilitator configuration fails closed. Pending or unknown settlement returns HTTP 503 without a new payment challenge or a success receipt. It is not evidence that no funds moved; follow the reconciliation instructions before issuing another payment. EIP-3009 does not cryptographically sign the requested URI/method/body. The local nonce guard is process-local, including on Vercel; replicas do not share a durable settlement journal or response cache.
 
-Configuration:
+## Configuration
+
+```text
+PAYEE_ADDRESS=0xb5aFc89b57Fa8270bB7261348179D28099BEa2a0
+X402_FACILITATOR_URL=https://facilitator.payai.network
+X402_PUBLIC_BASE_URL=https://baseaudit-x402.vercel.app
+BASE_RPC_URL=https://mainnet.base.org
+```
 
 - `PAYEE_ADDRESS`: defaults to `0xb5aFc89b57Fa8270bB7261348179D28099BEa2a0`.
 - `X402_FACILITATOR_URL`: explicit trusted HTTPS facilitator supporting exact USDC on Base.
 - `X402_FACILITATOR_BEARER_TOKEN`: optional provider bearer token; static tokens are not automatic CDP JWT authentication.
 - `X402_PUBLIC_BASE_URL`: deployed HTTPS origin, recommended behind a proxy.
 - `BASE_RPC_URL`: defaults to `https://mainnet.base.org`; provider availability is not guaranteed.
+
+The secret-free [`.env.example`](.env.example) records an explicit PayAI configuration. Neither `.env.example` nor `.env` is loaded automatically: set these values in the process or deployment environment before starting the application. Set `X402_PUBLIC_BASE_URL` to the correct external HTTPS origin when deploying elsewhere. The helper's empty facilitator default remains unchanged and fails closed.
+
+PayAI accepts ordinary `exact` payments within its free tier without an API key, bearer token, or CDP JWT; leave `X402_FACILITATOR_BEARER_TOKEN` unset for this configuration. Other facilitator authentication remains provider-specific. See the [developer reference](https://facilitator.payai.network/developers).
+
+The default allowance is **1,000 lifetime credits per receiving wallet**, also subject to shared-host/IP pools. Deployments using the same payee share its allowance. This is not a monthly reset or a guarantee of 1,000 settlements; rates change on 21 September 2026 at 12:00 UTC. Check the current [pricing](https://docs.payai.network/x402/facilitators/pricing). No automatic credit purchases or top-ups are configured. Exhaustion returns facilitator HTTP 403 with `free_tier_exhausted`; the payment gate fails closed without releasing protected content.
+
+An unauthenticated `/supported` check on 16 September 2026 advertised x402 v2 `exact` on `eip155:8453`. This is capability metadata only: remaining allowance, signed payment verification, and live settlement have not been tested.
 
 ## Local verification
 
@@ -55,3 +70,8 @@ python -m pytest -q
 Tests use local mocks for the facilitator and RPC; they do not send payments or rely on live Base data. Regression coverage includes **`test_fake_header_does_not_unlock_resource`**, with assertions that analysis, RPC, and verification never run for fake headers, plus malformed upstream data, PUSH operand false positives, proxy scope, and discovery.
 
 A local test pass does not establish live facilitator credentials, a successful chain settlement, Vercel deployment health, or indexing by an external marketplace.
+
+CI runs the suite on Python 3.12, including `test_fake_header_does_not_unlock_resource`,
+using the hashed dependency installation above. As of 16 September 2026, GitHub
+branch protection on `main` requires the `payment-security` check, requires the
+branch to be up to date (strict mode), and enforces these rules for administrators.
