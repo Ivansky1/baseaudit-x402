@@ -1,0 +1,28 @@
+name: Payment security regression
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  payment-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements.txt
+            requirements-dev.txt
+      - name: Install hash-locked dependencies and validate direct pins
+        run: python -m pip install --require-hashes -r requirements.lock -r requirements-dev.txt
+      - name: Payment boundary and business regressions (mocked providers only)
+        run: python -m pytest -q
+      - run: python -m compileall -q .

@@ -1,541 +1,280 @@
-"""
-BaseAudit Oracle — Real-Time Smart Contract Security & Bytecode Audit Oracle for Base Mainnet.
+"""Bounded, read-only Base bytecode observations behind a verified x402 gate."""
+from __future__ import annotations
 
-Analyzes smart contract bytecodes, verifies EIP-1967 proxy implementations, audits dangerous opcodes
-(SELFDESTRUCT, DELEGATECALL), detects token standards, and calculates risk scores on Base (Chain ID 8453).
-Payable via x402 micro-payments ($0.02 USDC on Base).
-"""
-
-import base64
+import asyncio
 from datetime import datetime, timezone
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Annotated
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-# Constants & Configuration
-PAYEE_ADDRESS = os.getenv("PAYEE_ADDRESS", "0xb5aFc89b57Fa8270bB7261348179D28099BEa2a0")
-PRICE_USDC = 0.02
-PRICE_ATOMIC = "20000"  # 0.02 USDC (6 decimals = 20,000 atomic units)
-CHAIN_ID = "eip155:8453"
-USDC_ASSET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+from x402_payment import NETWORK, USDC_ASSET, PaidOperation, PaymentGate, configured_payee
+
+PAYEE_ADDRESS = configured_payee()
+PRICE_ATOMIC = "20000"
+CHAIN_ID = NETWORK
 BASE_RPC_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
-
-# EIP-1967 Storage Slots
+ADDRESS_PATTERN = r"^0x[0-9a-fA-F]{40}$"
+MAX_BYTECODE_BYTES = 65536
+MAX_RPC_RESPONSE_BYTES = 150000
 EIP1967_IMPL_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
 EIP1967_ADMIN_SLOT = "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103"
 EIP1967_BEACON_SLOT = "0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50"
-
-# Common standard selectors
 FUNCTION_SELECTORS = {
-    "0xa9059cbb": ("transfer(address,uint256)", "ERC-20"),
-    "0x23b872dd": ("transferFrom(address,address,uint256)", "ERC-20/ERC-721"),
-    "0x70a08231": ("balanceOf(address)", "ERC-20/ERC-721"),
-    "0x095ea7b3": ("approve(address,uint256)", "ERC-20"),
-    "0x18160ddd": ("totalSupply()", "ERC-20/ERC-721"),
-    "0x6352211e": ("ownerOf(uint256)", "ERC-721"),
-    "0x42842e0e": ("safeTransferFrom(address,address,uint256)", "ERC-721"),
-    "0x40c10f19": ("mint(address,uint256)", "Mintable"),
-    "0xa0712d68": ("mint(uint256)", "Mintable"),
-    "0x8456cb59": ("pause()", "Pausable"),
-    "0x3f4ba63a": ("unpause()", "Pausable"),
-    "0x8da5cb5b": ("owner()", "Ownable"),
-    "0xf2fde38b": ("transferOwnership(address)", "Ownable"),
-    "0x3659cfe6": ("upgradeTo(address)", "Upgradeable"),
-    "0x4f1ee3d0": ("upgradeToAndCall(address,bytes)", "Upgradeable"),
+    "a9059cbb": ("transfer(address,uint256)", "ERC-20"),
+    "23b872dd": ("transferFrom(address,address,uint256)", "ERC-20/ERC-721"),
+    "70a08231": ("balanceOf(address)", "ERC-20/ERC-721"),
+    "095ea7b3": ("approve(address,uint256)", "ERC-20/ERC-721"),
+    "18160ddd": ("totalSupply()", "ERC-20/ERC-721"),
+    "6352211e": ("ownerOf(uint256)", "ERC-721"),
+    "42842e0e": ("safeTransferFrom(address,address,uint256)", "ERC-721"),
+    "40c10f19": ("mint(address,uint256)", "Mintable"),
+    "a0712d68": ("mint(uint256)", "Mintable"),
+    "8456cb59": ("pause()", "Pausable"),
+    "3f4ba63a": ("unpause()", "Pausable"),
+    "8da5cb5b": ("owner()", "Ownable"),
+    "f2fde38b": ("transferOwnership(address)", "Ownable"),
+    "3659cfe6": ("upgradeTo(address)", "Upgradeable"),
 }
+LIMITATIONS = [
+    "Static observations are not a security audit, simulation, or safety guarantee.",
+    "Linear disassembly skips PUSH operands but does not prove reachability; embedded data or metadata can resemble instructions.",
+    "PUSH4 selector matches do not prove that a function exists, is callable, or implements an interface.",
+    "Implementation code, permissions, control flow, and storage invariants are not analyzed.",
+    "Only EIP-1967 storage slots are checked; an empty slot does not rule out other proxy designs.",
+    "A numbered block is used consistently; RPC trust and chain reorganizations remain limitations.",
+]
 
-app = FastAPI(
-    title="BaseAudit Oracle x402",
-    description="Real-Time Smart Contract Security & Bytecode Audit Oracle for Base Mainnet, payable via x402.",
-    version="1.0.0",
-    redirect_slashes=False,
-    contact={
-        "name": "BaseAudit Oracle",
-        "email": "ivansky.dev@gmail.com",
-        "url": "https://github.com/Ivansky1/baseaudit-x402",
-    },
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="BaseAudit Oracle x402", version="2.0.0", redirect_slashes=False,
+              description="Static Base runtime bytecode and EIP-1967 slot observations. Not a security audit.")
 
 
-def make_x402_challenge(resource_url: str, description: str = "BaseAudit Oracle API Access") -> Dict[str, Any]:
-    """Generate canonical x402 v2 challenge payload passing 100% of discovery checks."""
-    return {
-        "x402Version": 2,
-        "version": 2,
-        "resource": {
-            "url": resource_url,
-            "description": f"{description} (${PRICE_USDC:.2f} USDC)",
-            "mimeType": "application/json",
-        },
-        "accepts": [
-            {
-                "scheme": "exact",
-                "network": CHAIN_ID,
-                "asset": USDC_ASSET,
-                "amount": PRICE_ATOMIC,
-                "maxAmountRequired": PRICE_ATOMIC,
-                "payee": PAYEE_ADDRESS,
-                "payTo": PAYEE_ADDRESS,
-                "maxTimeoutSeconds": 300,
-                "description": f"{description} (${PRICE_USDC:.2f} USDC)",
-                "extra": {
-                    "name": "USD Coin",
-                    "version": "2",
-                    "assetTransferMethod": "eip3009",
-                },
-            }
-        ],
-        "extensions": {
-            "bazaar": {
-                "info": {
-                    "name": "Base Contract Security Audit",
-                    "description": "Real-time bytecode security audit and proxy analysis for Base smart contracts.",
-                    "input": {
-                        "type": "object",
-                        "properties": {
-                            "address": {
-                                "type": "string",
-                                "description": "Base contract address to audit (0x...)",
-                                "default": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-                            }
-                        },
-                        "required": ["address"],
-                    },
-                    "output": {
-                        "type": "object",
-                        "properties": {
-                            "address": {"type": "string"},
-                            "is_contract": {"type": "boolean"},
-                            "bytecode_size_bytes": {"type": "integer"},
-                            "is_proxy": {"type": "boolean"},
-                            "implementation_address": {"type": "string"},
-                            "risk_score": {"type": "integer"},
-                            "risk_level": {"type": "string"},
-                            "security_findings": {"type": "array"},
-                        },
-                    },
-                },
-                "schema": {
-                    "properties": {
-                        "input": {
-                            "properties": {
-                                "queryParams": {
-                                    "type": "object",
-                                    "properties": {
-                                        "address": {
-                                            "type": "string",
-                                            "default": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-                                        }
-                                    },
-                                }
-                            }
-                        },
-                        "output": {
-                            "properties": {
-                                "example": {
-                                    "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-                                    "is_contract": True,
-                                    "bytecode_size_bytes": 1944,
-                                    "is_proxy": True,
-                                    "proxy_type": "EIP-1967",
-                                    "implementation_address": "0x2e651563604f32e336e1c4e797a73fc42d992f15",
-                                    "admin_address": "0x0000000000000000000000000000000000000000",
-                                    "standards_detected": ["ERC-20", "Upgradeable", "Ownable"],
-                                    "risk_score": 90,
-                                    "risk_level": "LOW",
-                                    "security_findings": [],
-                                }
-                            }
-                        },
-                    }
-                },
-            }
-        },
-    }
+class UpstreamUnavailable(ValueError):
+    """RPC data is unavailable or does not meet the expected schema."""
 
 
-def is_valid_evm_address(addr: str) -> bool:
-    return bool(re.match(r"^0x[a-fA-F0-9]{40}$", addr))
-
-
-async def rpc_call(method: str, params: list) -> Any:
-    """Execute raw JSON-RPC call against Base mainnet RPC."""
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(BASE_RPC_URL, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            raise HTTPException(status_code=502, detail=f"Base RPC Error: {data['error']}")
-        return data.get("result")
-
-
-def parse_address_from_slot(slot_hex: Optional[str]) -> Optional[str]:
-    """Extract clean 20-byte EVM address from 32-byte storage slot."""
-    if not slot_hex or slot_hex == "0x" or slot_hex == "0x0":
-        return None
-    clean = slot_hex.replace("0x", "").zfill(64)
-    addr_part = clean[-40:]
-    if addr_part == "0" * 40:
-        return None
-    return "0x" + addr_part.lower()
-
-
-async def analyze_contract(address: str) -> Dict[str, Any]:
-    """Perform comprehensive bytecode and proxy analysis on Base contract."""
-    address = address.lower()
-    code = await rpc_call("eth_getCode", [address, "latest"])
-
-    if not code or code == "0x":
-        return {
-            "address": address,
-            "network": "Base (Chain ID 8453)",
-            "is_contract": False,
-            "bytecode_size_bytes": 0,
-            "is_proxy": False,
-            "risk_score": 100,
-            "risk_level": "INFO",
-            "security_findings": ["Address is an Externally Owned Account (EOA), not a smart contract."],
-            "standards_detected": [],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    raw_hex = code[2:].lower()
-    code_bytes = bytes.fromhex(raw_hex)
-    size_bytes = len(code_bytes)
-
-    # 1. Proxy detection via EIP-1967 slots
-    impl_slot_val = await rpc_call("eth_getStorageAt", [address, EIP1967_IMPL_SLOT, "latest"])
-    admin_slot_val = await rpc_call("eth_getStorageAt", [address, EIP1967_ADMIN_SLOT, "latest"])
-    beacon_slot_val = await rpc_call("eth_getStorageAt", [address, EIP1967_BEACON_SLOT, "latest"])
-
-    impl_addr = parse_address_from_slot(impl_slot_val)
-    admin_addr = parse_address_from_slot(admin_slot_val)
-    beacon_addr = parse_address_from_slot(beacon_slot_val)
-
-    is_proxy = False
-    proxy_type = "None"
-    if impl_addr:
-        is_proxy = True
-        proxy_type = "EIP-1967 Transparent/UUPS Proxy"
-    elif beacon_addr:
-        is_proxy = True
-        proxy_type = "EIP-1967 Beacon Proxy"
-
-    # 2. Selector detection
-    standards_set = set()
-    detected_functions = []
-    for selector, (fn_name, standard) in FUNCTION_SELECTORS.items():
-        sel_clean = selector[2:]
-        if sel_clean in raw_hex:
-            detected_functions.append(fn_name)
-            standards_set.add(standard)
-
-    # 3. Dangerous opcode scanning
-    # SELFDESTRUCT = 0xff, DELEGATECALL = 0xf4
-    has_selfdestruct = b"\xff" in code_bytes
-    has_delegatecall = b"\xf4" in code_bytes
-
-    findings = []
-    risk_score = 100
-
-    if has_selfdestruct:
-        findings.append("⚠️ SELFDESTRUCT opcode detected in bytecode. Contract can potentially be destroyed.")
-        risk_score -= 35
-
-    if is_proxy:
-        findings.append(f"ℹ️ Contract is an upgradeable proxy ({proxy_type}). Target logic: {impl_addr}")
-        if not admin_addr:
-            findings.append("ℹ️ Proxy does not expose standard EIP-1967 admin slot (may use UUPS governance).")
-
-    if has_delegatecall and not is_proxy:
-        findings.append("⚠️ DELEGATECALL opcode detected in non-proxy contract. Verify external execution safety.")
-        risk_score -= 15
-
-    if "Pausable" in standards_set:
-        findings.append("ℹ️ Contract contains pause() / unpause() functions. Admin can freeze state.")
-        risk_score -= 5
-
-    if "Mintable" in standards_set:
-        findings.append("ℹ️ Contract contains arbitrary mint() function. Check supply expansion limits.")
-        risk_score -= 10
-
-    if size_bytes > 24576:
-        findings.append("⚠️ Bytecode exceeds EIP-170 standard limit (24,576 bytes).")
-        risk_score -= 10
-
-    risk_score = max(5, min(100, risk_score))
-    if risk_score >= 80:
-        risk_level = "LOW"
-    elif risk_score >= 60:
-        risk_level = "MEDIUM"
-    elif risk_score >= 40:
-        risk_level = "HIGH"
-    else:
-        risk_level = "CRITICAL"
-
-    return {
-        "address": address,
-        "network": "Base (Chain ID 8453)",
-        "is_contract": True,
-        "bytecode_size_bytes": size_bytes,
-        "is_proxy": is_proxy,
-        "proxy_type": proxy_type,
-        "implementation_address": impl_addr,
-        "admin_address": admin_addr,
-        "beacon_address": beacon_addr,
-        "standards_detected": sorted(list(standards_set)),
-        "functions_detected": sorted(detected_functions),
-        "has_selfdestruct": has_selfdestruct,
-        "has_delegatecall": has_delegatecall,
-        "risk_score": risk_score,
-        "risk_level": risk_level,
-        "security_findings": findings,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-# Models
-class AuditRequest(BaseModel):
-    address: str = Field(..., description="Base smart contract address to audit (0x...)")
-
-
-# ==============================================================================
-# Public Discovery Endpoints (Free)
-# ==============================================================================
-
-@app.get("/", tags=["discovery"])
-async def root():
-    return {
-        "service": "BaseAudit Oracle x402",
-        "description": "Real-Time Smart Contract Security & Bytecode Audit Oracle on Base",
-        "version": "1.0.0",
-        "pricing": f"${PRICE_USDC:.2f} USDC per audit",
-        "currency": "USDC (Base)",
-        "payee": PAYEE_ADDRESS,
-        "endpoints": {
-            "/v1/audit": f"POST/GET — Full smart contract bytecode audit (${PRICE_USDC:.2f} USDC)",
-            "/v1/proxy": f"POST/GET — EIP-1967 proxy verification & logic resolver (${PRICE_USDC:.2f} USDC)",
-            "/.well-known/x402": "GET — Canonical x402 Protocol Manifest",
-            "/health": "GET — Service health and Base RPC status",
-            "/self-test": "GET — Free sample security report (USDC on Base)",
-        },
-    }
-
-
-@app.get("/health", tags=["discovery"])
-async def health():
+async def rpc_call(method: str, params: list):
+    """A bounded JSON-RPC read; provider bodies never become client errors."""
     try:
-        block = await rpc_call("eth_blockNumber", [])
-        return {
-            "status": "healthy",
-            "network": "Base Mainnet",
-            "chain_id": 8453,
-            "latest_block_hex": block,
-            "latest_block": int(block, 16) if block else None,
-            "oracle_timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception as e:
-        return {"status": "degraded", "error": str(e)}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0),
+                                     follow_redirects=False, trust_env=False) as client:
+            async with client.stream("POST", BASE_RPC_URL, json={
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+            }) as response:
+                response.raise_for_status()
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > MAX_RPC_RESPONSE_BYTES:
+                        raise UpstreamUnavailable("RPC response exceeds the limit")
+                result = json.loads(body)
+        if (not isinstance(result, dict) or result.get("jsonrpc") != "2.0"
+                or type(result.get("id")) is not int or result["id"] != 1
+                or "error" in result or "result" not in result):
+            raise UpstreamUnavailable("Invalid RPC response")
+        return result["result"]
+    except (httpx.HTTPError, ValueError, TypeError, RecursionError):
+        raise UpstreamUnavailable("Base RPC is unavailable") from None
 
 
-@app.get("/self-test", tags=["discovery"])
+def rpc_quantity(value):
+    if not isinstance(value, str) or not re.fullmatch(r"0x(?:0|[1-9a-fA-F][0-9a-fA-F]{0,63})", value):
+        raise UpstreamUnavailable("Invalid RPC quantity")
+    return int(value, 16)
+
+
+def parse_address_from_slot(value):
+    if not isinstance(value, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", value):
+        raise UpstreamUnavailable("Invalid storage word")
+    if int(value[2:26], 16) != 0:
+        raise UpstreamUnavailable("Storage word is not a padded address")
+    return "0x" + value[-40:].lower() if int(value, 16) else None
+
+
+def decode_bytecode(value):
+    if (not isinstance(value, str) or len(value) > 2 + MAX_BYTECODE_BYTES * 2
+            or not re.fullmatch(r"0x(?:[0-9a-fA-F]{2})*", value)):
+        raise UpstreamUnavailable("Invalid runtime bytecode")
+    return bytes.fromhex(value[2:])
+
+
+def inspect_bytecode(code: bytes):
+    """Linear EVM decoding: PUSH1..PUSH32 immediate data is never an opcode."""
+    offsets = {"SELFDESTRUCT": [], "DELEGATECALL": []}
+    selectors = set()
+    pc, truncated = 0, False
+    while pc < len(code):
+        offset, opcode = pc, code[pc]
+        pc += 1
+        if 0x60 <= opcode <= 0x7F:
+            width = opcode - 0x5F
+            if pc + width > len(code):
+                truncated = True
+                break
+            if width == 4:
+                selector = code[pc:pc + width].hex()
+                if selector in FUNCTION_SELECTORS:
+                    selectors.add(selector)
+            pc += width
+        elif opcode == 0xFF:
+            offsets["SELFDESTRUCT"].append(offset)
+        elif opcode == 0xF4:
+            offsets["DELEGATECALL"].append(offset)
+    hints = [{"selector": "0x" + selector, "function": FUNCTION_SELECTORS[selector][0],
+              "interface_hint": FUNCTION_SELECTORS[selector][1]} for selector in sorted(selectors)]
+    findings = []
+    if offsets["SELFDESTRUCT"]:
+        findings.append({"code": "selfdestruct_instruction", "severity": "review",
+                         "message": "SELFDESTRUCT instruction observed; reachability and effects are unverified. Modern EVM rules restrict code deletion."})
+    if offsets["DELEGATECALL"]:
+        findings.append({"code": "delegatecall_instruction", "severity": "review",
+                         "message": "DELEGATECALL instruction observed; the target and access controls are unverified."})
+    if truncated:
+        findings.append({"code": "truncated_push_operand", "severity": "info",
+                         "message": "Runtime ends within a PUSH operand; disassembly is incomplete."})
+    return {"has_selfdestruct": bool(offsets["SELFDESTRUCT"]),
+            "has_delegatecall": bool(offsets["DELEGATECALL"]),
+            "opcode_offsets": offsets, "selector_hints": hints,
+            "standards_confirmed": [], "disassembly_complete": not truncated,
+            "security_findings": findings}
+
+
+async def analyze_contract(address: str):
+    if not isinstance(address, str) or not re.fullmatch(ADDRESS_PATTERN, address):
+        raise ValueError("Invalid address")
+    address = address.lower()
+    chain, block = await asyncio.gather(rpc_call("eth_chainId", []), rpc_call("eth_blockNumber", []))
+    if rpc_quantity(chain) != 8453:
+        raise UpstreamUnavailable("Unexpected RPC chain")
+    block_number = rpc_quantity(block)
+    block_tag = hex(block_number)
+    code = decode_bytecode(await rpc_call("eth_getCode", [address, block_tag]))
+    result = {
+        "address": address, "network": NETWORK, "chain_id": 8453, "block_number": block_number,
+        "timestamp": datetime.now(timezone.utc).isoformat(), "analysis_type": "static_onchain_heuristic",
+        "analysis_scope": "queried_address_runtime_only", "confidence": "limited",
+        "is_contract": bool(code), "bytecode_size_bytes": len(code), "risk_score": None,
+        "risk_level": "NOT_ASSESSED", "is_proxy": None, "proxy_type": None,
+        "implementation_address": None, "admin_address": None, "beacon_address": None,
+        "implementation_analysis": "not_performed", "beacon_implementation_resolution": "not_applicable",
+        "proxy_detection": "not_checked", "limitations": list(LIMITATIONS),
+        "data_sources": [{"provider": "configured_base_rpc", "method": "eth_chainId"},
+                         {"provider": "configured_base_rpc", "method": "eth_blockNumber"},
+                         {"provider": "configured_base_rpc", "method": "eth_getCode", "block": block_tag}],
+        **inspect_bytecode(code),
+    }
+    if not code:
+        result["proxy_detection"] = "no_runtime_bytecode"
+        result["security_findings"].append({"code": "no_runtime_bytecode", "severity": "info",
+                                           "message": "No runtime code at the observed block; this does not establish account type or safety."})
+        return result
+    slots = [EIP1967_IMPL_SLOT, EIP1967_ADMIN_SLOT, EIP1967_BEACON_SLOT]
+    values = await asyncio.gather(*(rpc_call("eth_getStorageAt", [address, slot, block_tag]) for slot in slots))
+    impl, admin, beacon = [parse_address_from_slot(value) for value in values]
+    result.update(implementation_address=impl, admin_address=admin, beacon_address=beacon,
+                  proxy_detection="eip1967_slot_observed" if impl or beacon else "no_eip1967_proxy_slot_observed")
+    result["data_sources"].extend({"provider": "configured_base_rpc", "method": "eth_getStorageAt",
+                                   "slot": slot, "block": block_tag} for slot in slots)
+    if impl or beacon:
+        result["is_proxy"] = True
+        result["proxy_type"] = "EIP-1967 implementation slot" if impl else "EIP-1967 beacon slot"
+        result["analysis_scope"] = "proxy_runtime_only"
+        result["security_findings"].append({"code": "proxy_slot_observed", "severity": "info",
+                                           "message": "EIP-1967 address observed. Proxy behavior and implementation code are not verified."})
+    if beacon:
+        result["beacon_implementation_resolution"] = "not_supported"
+        result["limitations"].append("Beacon implementation() is not called; the beacon's implementation is unresolved.")
+    if impl and beacon:
+        result["security_findings"].append({"code": "conflicting_proxy_slots", "severity": "review",
+                                           "message": "Both implementation and beacon slots are populated; active delegation is not established."})
+    return result
+
+
+def upstream_error():
+    return JSONResponse(status_code=502, content={"success": False, "error": {
+        "code": "upstream_unavailable", "message": "Base bytecode data is unavailable."}})
+
+
+class AuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    address: str = Field(min_length=42, max_length=42, pattern=ADDRESS_PATTERN)
+
+
+AddressQuery = Annotated[str, Query(min_length=42, max_length=42, pattern=ADDRESS_PATTERN)]
+
+
+async def _observe(address, *, proxy_only=False):
+    try:
+        audit = await analyze_contract(address)
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, OverflowError):
+        return upstream_error()
+    if proxy_only:
+        keys = ("address", "network", "block_number", "is_contract", "is_proxy", "proxy_type",
+                "implementation_address", "admin_address", "beacon_address", "proxy_detection",
+                "implementation_analysis", "beacon_implementation_resolution", "analysis_type",
+                "analysis_scope", "confidence", "limitations", "data_sources", "timestamp")
+        return {"success": True, **{key: audit.get(key) for key in keys}}
+    return {"success": True, "oracle": "BaseAudit Oracle", "audit": audit}
+
+
+@app.get("/v1/audit", summary="Observe Base runtime bytecode and proxy slots")
+async def audit_endpoint(address: AddressQuery):
+    return await _observe(address)
+
+
+@app.api_route("/v1/audit", methods=["POST", "HEAD"], include_in_schema=False)
+async def audit_compat(payload: AuditRequest):
+    return await _observe(payload.address)
+
+
+@app.get("/v1/proxy", summary="Read Base EIP-1967 address slots")
+async def proxy_endpoint(address: AddressQuery):
+    return await _observe(address, proxy_only=True)
+
+
+@app.api_route("/v1/proxy", methods=["POST", "HEAD"], include_in_schema=False)
+async def proxy_compat(payload: AuditRequest):
+    return await _observe(payload.address, proxy_only=True)
+
+
+@app.get("/")
+async def root():
+    return {"service": "BaseAudit Oracle x402", "version": "2.0.0", "network": NETWORK,
+            "description": "Static bytecode and EIP-1967 slot observations; not a security audit.",
+            "price_usdc": "0.02", "payee": PAYEE_ADDRESS, "docs": "/docs", "manifest": "/.well-known/x402"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "baseaudit-x402", "check_type": "process_only"}
+
+
+@app.get("/self-test")
 async def self_test():
-    """Free sample contract audit for USDC on Base."""
-    data = await analyze_contract(USDC_ASSET)
-    return {
-        "sample": True,
-        "note": "Free preview audit for USDC (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913) on Base.",
-        "audit": data,
-    }
+    return {"status": "configured", "check_type": "configuration_only", "network": NETWORK,
+            "facilitator_configured": bool(os.getenv("X402_FACILITATOR_URL")), "payee": PAYEE_ADDRESS}
 
 
-@app.get("/.well-known/x402", tags=["discovery"])
-async def well_known_x402(request: Request):
-    origin = str(request.base_url).rstrip("/")
-    return {
-        "x402Version": 2,
-        "version": 2,
-        "name": "BaseAudit Oracle x402",
-        "description": "Real-Time Smart Contract Bytecode Security & Proxy Audit Oracle on Base Mainnet.",
-        "homepage": origin,
-        "payment": {
-            "network": CHAIN_ID,
-            "asset": USDC_ASSET,
-            "amount": PRICE_ATOMIC,
-            "payee": PAYEE_ADDRESS,
-            "payTo": PAYEE_ADDRESS,
-        },
-        "resources": [
-            {
-                "url": f"{origin}/v1/audit",
-                "methods": ["GET", "POST", "HEAD"],
-                "description": f"Complete smart contract bytecode & proxy audit (${PRICE_USDC:.2f} USDC)",
-                "amount": PRICE_ATOMIC,
-                "asset": USDC_ASSET,
-                "payTo": PAYEE_ADDRESS,
-            },
-            {
-                "url": f"{origin}/v1/proxy",
-                "methods": ["GET", "POST", "HEAD"],
-                "description": f"EIP-1967 proxy implementation & admin resolver (${PRICE_USDC:.2f} USDC)",
-                "amount": PRICE_ATOMIC,
-                "asset": USDC_ASSET,
-                "payTo": PAYEE_ADDRESS,
-            },
-        ],
-    }
+@app.get("/.well-known/x402")
+async def manifest(request: Request):
+    return payment.manifest(request)
 
 
-# ==============================================================================
-# Paid Oracle Endpoints (x402 Protected)
-# ==============================================================================
-
-@app.api_route("/v1/audit", methods=["GET", "POST", "HEAD"], tags=["oracle"])
-async def audit_endpoint(
-    request: Request,
-    address: Optional[str] = None,
-    authorization: Optional[str] = Header(None),
-    x_payment: Optional[str] = Header(None, alias="X-Payment"),
-):
-    resource_url = str(request.url)
-    origin = str(request.base_url).rstrip("/")
-
-    # Check for x402 payment proof
-    has_payment = bool(x_payment or (authorization and authorization.lower().startswith("payment ")))
-
-    if not has_payment:
-        challenge = make_x402_challenge(resource_url, "BaseAudit Oracle Complete Smart Contract Security Audit")
-        return JSONResponse(status_code=402, content=challenge)
-
-    # Handle HEAD
-    if request.method == "HEAD":
-        return JSONResponse(status_code=200, content={})
-
-    target_addr = address
-    if not target_addr and request.method == "POST":
-        try:
-            body = await request.json()
-            if isinstance(body, dict):
-                target_addr = body.get("address")
-        except Exception:
-            pass
-
-    if not target_addr:
-        target_addr = USDC_ASSET
-
-    if not is_valid_evm_address(target_addr):
-        raise HTTPException(status_code=400, detail=f"Invalid EVM address format: '{target_addr}'")
-
-    audit_result = await analyze_contract(target_addr)
-    return {
-        "status": "success",
-        "oracle": "BaseAudit Oracle x402",
-        "network": "Base Mainnet (8453)",
-        "audit": audit_result,
-        "payment_processed": True,
-        "receipt": {
-            "amount_paid_usdc": PRICE_USDC,
-            "payee": PAYEE_ADDRESS,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
-    }
-
-
-@app.api_route("/v1/proxy", methods=["GET", "POST", "HEAD"], tags=["oracle"])
-async def proxy_endpoint(
-    request: Request,
-    address: Optional[str] = None,
-    authorization: Optional[str] = Header(None),
-    x_payment: Optional[str] = Header(None, alias="X-Payment"),
-):
-    resource_url = str(request.url)
-
-    has_payment = bool(x_payment or (authorization and authorization.lower().startswith("payment ")))
-
-    if not has_payment:
-        challenge = make_x402_challenge(resource_url, "BaseAudit Oracle EIP-1967 Proxy Verification")
-        return JSONResponse(status_code=402, content=challenge)
-
-    if request.method == "HEAD":
-        return JSONResponse(status_code=200, content={})
-
-    target_addr = address
-    if not target_addr and request.method == "POST":
-        try:
-            body = await request.json()
-            if isinstance(body, dict):
-                target_addr = body.get("address")
-        except Exception:
-            pass
-
-    if not target_addr:
-        target_addr = USDC_ASSET
-
-    if not is_valid_evm_address(target_addr):
-        raise HTTPException(status_code=400, detail=f"Invalid EVM address format: '{target_addr}'")
-
-    audit = await analyze_contract(target_addr)
-    return {
-        "status": "success",
-        "address": target_addr,
-        "is_proxy": audit.get("is_proxy"),
-        "proxy_type": audit.get("proxy_type"),
-        "implementation_address": audit.get("implementation_address"),
-        "admin_address": audit.get("admin_address"),
-        "beacon_address": audit.get("beacon_address"),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-# Custom OpenAPI 3.1 schema for x402scan indexing
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title="BaseAudit Oracle x402",
-        version="1.0.0",
-        description="Real-Time Smart Contract Security & Bytecode Audit Oracle for Base Mainnet, payable via x402.",
-        routes=app.routes,
-    )
-    openapi_schema["info"]["x-payment-info"] = {
-        "protocols": [
-            {
-                "x402": {
-                    "version": 2,
-                    "price": PRICE_USDC,
-                    "currency": "USDC",
-                    "network": CHAIN_ID,
-                    "asset": USDC_ASSET,
-                    "payTo": PAYEE_ADDRESS,
-                    "payee": PAYEE_ADDRESS,
-                }
-            }
-        ]
-    }
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-
-app.openapi = custom_openapi
+INPUT_SCHEMA = AuditRequest.model_json_schema()
+OUTPUT_SCHEMA = {"type": "object", "required": ["success"], "properties": {"success": {"type": "boolean"}}}
+payment = PaymentGate(service="BaseAudit", payee=PAYEE_ADDRESS, amount=PRICE_ATOMIC, operations=[
+    PaidOperation(method="GET", path="/v1/audit", description="Static Base runtime bytecode observations; no safety guarantee or implementation audit.",
+                  input_schema=INPUT_SCHEMA, output_schema=OUTPUT_SCHEMA, example={"address": USDC_ASSET}),
+    PaidOperation(method="GET", path="/v1/proxy", description="Read EIP-1967 address slots; beacon implementation resolution is unsupported.",
+                  input_schema=INPUT_SCHEMA, output_schema=OUTPUT_SCHEMA, example={"address": USDC_ASSET}),
+])
+payment.install(app)
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
